@@ -1,0 +1,260 @@
+"""
+Medical RAG Application Backend
+Main application file: main.py
+"""
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+import uvicorn
+import os
+from datetime import datetime
+
+from services.document_processor import DocumentProcessor
+from services.vector_store import VectorStore
+from services.llm_service import LLMService
+from models.schemas import (
+    QueryRequest, QueryResponse, DocumentUploadResponse,
+    DocumentListResponse, HealthResponse
+)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Medical RAG API",
+    description="RAG application for medical students",
+    version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize services
+document_processor = DocumentProcessor()
+vector_store = VectorStore()
+llm_service = LLMService()
+
+# Ensure data directories exist
+os.makedirs("data/documents", exist_ok=True)
+os.makedirs("data/faiss_index", exist_ok=True)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup"""
+    vector_store.load_index()
+    print("✅ Application started successfully")
+
+
+@app.get("/", response_model=HealthResponse)
+async def root():
+    """Health check endpoint"""
+    return HealthResponse(
+        status="healthy",
+        message="Medical RAG API is running",
+        timestamp=datetime.utcnow()
+    )
+
+
+@app.post("/upload", response_model=DocumentUploadResponse)
+async def upload_document(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Upload and process a medical document
+    Supports: PDF, TXT, MD files
+    """
+    try:
+        # Validate file type
+        allowed_extensions = [".pdf", ".txt", ".md"]
+        file_ext = os.path.splitext(file.filename)[1].lower()
+
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type. Allowed: {allowed_extensions}"
+            )
+
+        # Save file
+        file_path = os.path.join("data/documents", file.filename)
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        # Process document
+        chunks = document_processor.process_document(file_path, file.filename)
+
+        if not chunks:
+            raise HTTPException(
+                status_code=400,
+                detail="No content extracted from document"
+            )
+
+        # Add to vector store
+        vector_store.add_documents(chunks)
+
+        return DocumentUploadResponse(
+            success=True,
+            filename=file.filename,
+            chunks_created=len(chunks),
+            message="Document uploaded and processed successfully"
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query_documents(request: QueryRequest):
+    """
+    Query the RAG system with a medical question
+    """
+    try:
+        if not request.query.strip():
+            raise HTTPException(
+                status_code=400, detail="Query cannot be empty")
+
+        # Retrieve relevant documents
+        retrieved_docs = vector_store.search(
+            query=request.query,
+            top_k=request.top_k
+        )
+
+        if not retrieved_docs:
+            return QueryResponse(
+                query=request.query,
+                answer="I couldn't find any relevant information in the knowledge base. Please try uploading relevant medical documents first.",
+                sources=[],
+                retrieved_chunks=0
+            )
+
+        # Generate answer using LLM
+        answer = llm_service.generate_answer(
+            query=request.query,
+            context_docs=retrieved_docs,
+            system_prompt=request.system_prompt
+        )
+
+        # Format sources
+        sources = [
+            {
+                "filename": doc["metadata"]["source"],
+                "chunk_id": doc["metadata"]["chunk_id"],
+                "content": doc["content"][:200] + "...",
+                "similarity": float(doc["similarity"])
+            }
+            for doc in retrieved_docs
+        ]
+
+        return QueryResponse(
+            query=request.query,
+            answer=answer,
+            sources=sources,
+            retrieved_chunks=len(retrieved_docs)
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/documents", response_model=DocumentListResponse)
+async def list_documents():
+    """List all uploaded documents"""
+    try:
+        docs_dir = "data/documents"
+        if not os.path.exists(docs_dir):
+            return DocumentListResponse(documents=[], total=0)
+
+        files = os.listdir(docs_dir)
+        documents = [
+            {
+                "filename": f,
+                "size": os.path.getsize(os.path.join(docs_dir, f)),
+                "uploaded_at": datetime.fromtimestamp(
+                    os.path.getctime(os.path.join(docs_dir, f))
+                )
+            }
+            for f in files
+        ]
+
+        return DocumentListResponse(
+            documents=documents,
+            total=len(documents)
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/documents/{filename}")
+async def delete_document(filename: str):
+    """Delete a document and its embeddings"""
+    try:
+        file_path = os.path.join("data/documents", filename)
+
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # Delete file
+        os.remove(file_path)
+
+        # Note: In a production system, you'd also want to remove the
+        # specific embeddings from FAISS. For simplicity, we'll rebuild the index
+        # This could be optimized by maintaining a mapping of documents to embeddings
+
+        return {
+            "success": True,
+            "message": f"Document {filename} deleted successfully"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/rebuild-index")
+async def rebuild_index():
+    """Rebuild the entire FAISS index from all documents"""
+    try:
+        docs_dir = "data/documents"
+
+        if not os.path.exists(docs_dir):
+            raise HTTPException(status_code=404, detail="No documents found")
+
+        # Clear existing index
+        vector_store.clear_index()
+
+        # Process all documents
+        total_chunks = 0
+        files = os.listdir(docs_dir)
+
+        for filename in files:
+            file_path = os.path.join(docs_dir, filename)
+            chunks = document_processor.process_document(file_path, filename)
+            vector_store.add_documents(chunks)
+            total_chunks += len(chunks)
+
+        return {
+            "success": True,
+            "message": f"Index rebuilt successfully",
+            "documents_processed": len(files),
+            "total_chunks": total_chunks
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
